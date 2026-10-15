@@ -1,888 +1,267 @@
-# DPI Engine - Deep Packet Inspection System
+# DeepTrace
 
+DeepTrace is an offline PCAP deep packet inspection project. A C++ engine reads a capture, classifies IPv4 TCP and UDP packets, applies blocking rules, and writes a filtered PCAP plus a text report. A FastAPI service runs that engine. A React dashboard displays a fixed visual shell and does not call the API.
 
-This document explains **everything** about this project - from basic networking concepts to the complete code architecture. After reading this, you should understand exactly how packets flow through the system without needing to read the code.
+The shipped engine is **DPI Engine v2.0**, built from [`src/dpi_mt.cpp`](src/dpi_mt.cpp). It inspects offline captures. It does not sit inline on a live network interface.
 
----
+## Contents
 
-## Table of Contents
+1. [Overview](#overview)
+2. [Repository layout](#repository-layout)
+3. [Programs](#programs)
+4. [Shipped engine](#shipped-engine)
+   - [Pipeline](#pipeline)
+   - [Classification](#classification)
+   - [Blocking](#blocking)
+   - [Command-line interface](#command-line-interface)
+   - [Text report](#text-report)
+5. [Test capture](#test-capture)
+6. [Setup](#setup)
+   - [C++ engine](#c-engine)
+   - [Backend](#backend)
+   - [Dashboard](#dashboard-setup)
+7. [Environment variables](#environment-variables)
+8. [HTTP API](#http-api)
+   - [Health](#health)
+   - [Engine status](#engine-status)
+   - [Analyses](#analyses)
+   - [Rules](#rules)
+9. [Dashboard](#dashboard)
+10. [Tests](#tests)
+11. [Limitations](#limitations)
+12. [Roadmap](#roadmap)
 
-1. [What is DPI?](#1-what-is-dpi)
-2. [Networking Background](#2-networking-background)
-3. [Project Overview](#3-project-overview)
-4. [File Structure](#4-file-structure)
-5. [The Journey of a Packet (Simple Version)](#5-the-journey-of-a-packet-simple-version)
-6. [The Journey of a Packet (Multi-threaded Version)](#6-the-journey-of-a-packet-multi-threaded-version)
-7. [Deep Dive: Each Component](#7-deep-dive-each-component)
-8. [How SNI Extraction Works](#8-how-sni-extraction-works)
-9. [How Blocking Works](#9-how-blocking-works)
-10. [Building and Running](#10-building-and-running)
-11. [Understanding the Output](#11-understanding-the-output)
+## Overview
 
----
+![DeepTrace system architecture: fixture-only React dashboard, FastAPI backend, and the C++ engine](<docs/System Architecture.png>)
 
-## 1. What is DPI?
+Deep packet inspection here means reading past the Ethernet, IPv4, and TCP or UDP headers into the start of the payload.
 
-**Deep Packet Inspection (DPI)** is a technology used to examine the contents of network packets as they pass through a checkpoint. Unlike simple firewalls that only look at packet headers (source/destination IP), DPI looks *inside* the packet payload.
+HTTPS encrypts the application data after the handshake. The TLS Client Hello still carries the Server Name Indication (SNI) in the clear, and that name is what v2.0 uses to name an application. The engine does not decrypt TLS.
 
-### Real-World Uses:
-- **ISPs**: Throttle or block certain applications (e.g., BitTorrent)
-- **Enterprises**: Block social media on office networks
-- **Parental Controls**: Block inappropriate websites
-- **Security**: Detect malware or intrusion attempts
+A flow is the directional 5-tuple:
 
-### What Our DPI Engine Does:
-```
-User Traffic (PCAP) → [DPI Engine] → Filtered Traffic (PCAP)
-                           ↓
-                    - Identifies apps (YouTube, Facebook, etc.)
-                    - Blocks based on rules
-                    - Generates reports
-```
+| Field | Role |
+| --- | --- |
+| Source IP | Sending host |
+| Destination IP | Receiving host |
+| Source port | Sending port |
+| Destination port | Receiving port |
+| Protocol | TCP (6) or UDP (17) |
 
----
+The reverse direction is a different 5-tuple. v2.0 hashes and stores each direction on its own.
 
-## 2. Networking Background
+## Repository layout
 
-### The Network Stack (Layers)
-
-When you visit a website, data travels through multiple "layers":
-
-```
-┌─────────────────────────────────────────────────────────┐
-│ Layer 7: Application    │ HTTP, TLS, DNS               │
-├─────────────────────────────────────────────────────────┤
-│ Layer 4: Transport      │ TCP (reliable), UDP (fast)   │
-├─────────────────────────────────────────────────────────┤
-│ Layer 3: Network        │ IP addresses (routing)       │
-├─────────────────────────────────────────────────────────┤
-│ Layer 2: Data Link      │ MAC addresses (local network)│
-└─────────────────────────────────────────────────────────┘
-```
-
-### A Packet's Structure
-
-Every network packet is like a **Russian nesting doll** - headers wrapped inside headers:
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│ Ethernet Header (14 bytes)                                       │
-│ ┌──────────────────────────────────────────────────────────────┐ │
-│ │ IP Header (20 bytes)                                         │ │
-│ │ ┌──────────────────────────────────────────────────────────┐ │ │
-│ │ │ TCP Header (20 bytes)                                    │ │ │
-│ │ │ ┌──────────────────────────────────────────────────────┐ │ │ │
-│ │ │ │ Payload (Application Data)                           │ │ │ │
-│ │ │ │ e.g., TLS Client Hello with SNI                      │ │ │ │
-│ │ │ └──────────────────────────────────────────────────────┘ │ │ │
-│ │ └──────────────────────────────────────────────────────────┘ │ │
-│ └──────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### The Five-Tuple
-
-A **connection** (or "flow") is uniquely identified by 5 values:
-
-| Field | Example | Purpose |
-|-------|---------|---------|
-| Source IP | 192.168.1.100 | Who is sending |
-| Destination IP | 172.217.14.206 | Where it's going |
-| Source Port | 54321 | Sender's application identifier |
-| Destination Port | 443 | Service being accessed (443 = HTTPS) |
-| Protocol | TCP (6) | TCP or UDP |
-
-**Why is this important?** 
-- All packets with the same 5-tuple belong to the same connection
-- If we block one packet of a connection, we should block all of them
-- This is how we "track" conversations between computers
-
-### What is SNI?
-
-**Server Name Indication (SNI)** is part of the TLS/HTTPS handshake. When you visit `https://www.youtube.com`:
-
-1. Your browser sends a "Client Hello" message
-2. This message includes the domain name in **plaintext** (not encrypted yet!)
-3. The server uses this to know which certificate to send
-
-```
-TLS Client Hello:
-├── Version: TLS 1.2
-├── Random: [32 bytes]
-├── Cipher Suites: [list]
-└── Extensions:
-    └── SNI Extension:
-        └── Server Name: "www.youtube.com"  ← We extract THIS!
+```text
+DeepTrace/
+├── README.md
+├── WINDOWS_SETUP.md          # Extra Windows installer notes
+├── CMakeLists.txt            # Builds the packet printer, not v2.0
+├── generate_test_pcap.py     # Writes a local test_dpi.pcap
+├── include/                  # Shared headers
+├── src/
+│   ├── dpi_mt.cpp            # Shipped v2.0 engine
+│   ├── main_working.cpp      # Single-threaded DPI tool
+│   ├── main_simple.cpp       # Single-file SNI printer
+│   ├── main.cpp              # CMake packet printer
+│   ├── main_dpi.cpp          # Unused v1.0 command line
+│   ├── dpi_engine.cpp        # Unused v1.0 core
+│   ├── fast_path.cpp
+│   ├── load_balancer.cpp
+│   ├── rule_manager.cpp
+│   ├── connection_tracker.cpp
+│   ├── pcap_reader.cpp
+│   ├── packet_parser.cpp
+│   ├── sni_extractor.cpp
+│   └── types.cpp
+├── backend/
+│   ├── requirements.txt
+│   ├── pytest.ini
+│   ├── app/                  # FastAPI 0.1.0
+│   └── tests/
+└── frontend/                 # Vite + React visual shell
 ```
 
-**This is the key to DPI**: Even though HTTPS is encrypted, the domain name is visible in the first packet!
+These paths are created or built locally and are not part of the Git tree:
 
----
+| Path | Why it is absent |
+| --- | --- |
+| `dpi_engine.exe`, `dpi_engine` | Root engine binaries are gitignored |
+| `test_dpi.pcap` and other `*.pcap` / `*.pcapng` files | Captures are gitignored |
+| `frontend/node_modules/`, `frontend/dist/` | Dependencies and build output |
+| `.venv/`, `__pycache__/` | Local Python environment |
+| `.deeptrace-runs/` | Default directory for API analysis output |
 
-## 3. Project Overview
+## Programs
 
-### What This Project Does
+| Program | Sources | What it is |
+| --- | --- | --- |
+| Shipped engine, DPI Engine v2.0 | `src/dpi_mt.cpp` plus `pcap_reader.cpp`, `packet_parser.cpp`, `sni_extractor.cpp`, `types.cpp` | Multi-threaded offline DPI tool. The API launches this executable. |
+| Single-threaded DPI tool | `src/main_working.cpp` and the same four support files | Same classification and rule ideas on one thread, with no `--lbs` or `--fps`. |
+| SNI printer | `src/main_simple.cpp` and the same four support files | Reads one PCAP and prints addresses and any TLS SNI. It does not filter or write an output capture. |
+| Packet printer | `src/main.cpp`, `pcap_reader.cpp`, `packet_parser.cpp` | Prints parsed headers. `CMakeLists.txt` builds this target as `packet_analyzer`. |
+| Modular engine v1.0 | `src/main_dpi.cpp`, `src/dpi_engine.cpp`, and the modular load-balancer, fast-path, rule, and connection-tracker sources | Separate CLI labeled v1.0. It is not compiled by CMake and the API does not launch it. |
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Wireshark   │     │ DPI Engine  │     │ Output      │
-│ Capture     │ ──► │             │ ──► │ PCAP        │
-│ (input.pcap)│     │ - Parse     │     │ (filtered)  │
-└─────────────┘     │ - Classify  │     └─────────────┘
-                    │ - Block     │
-                    │ - Report    │
-                    └─────────────┘
-```
+v1.0 accepts `--rules`, `--verbose`, and wildcard domain patterns such as `*.example.com`. Those options belong to that unused program. The shipped v2.0 command line is documented below.
 
-### Two Versions
+## Shipped engine
 
-| Version | File | Use Case |
-|---------|------|----------|
-| Simple (Single-threaded) | `src/main_working.cpp` | Learning, small captures |
-| Multi-threaded | `src/dpi_mt.cpp` | Production, large captures |
+### Pipeline
 
----
+Default threading is 2 load balancers and 2 fast paths per load balancer (4 fast paths). `--lbs` and `--fps` change those counts. Load balancer `N` owns fast-path indexes `N * fps_per_lb` through `(N + 1) * fps_per_lb - 1`.
 
-## 4. File Structure
+![DPI engine architecture: PCAP reader, load balancers, fast paths, and output writer](docs/engine-architecture.png)
 
-```
-packet_analyzer/
-├── include/                    # Header files (declarations)
-│   ├── pcap_reader.h          # PCAP file reading
-│   ├── packet_parser.h        # Network protocol parsing
-│   ├── sni_extractor.h        # TLS/HTTP inspection
-│   ├── types.h                # Data structures (FiveTuple, AppType, etc.)
-│   ├── rule_manager.h         # Blocking rules (multi-threaded version)
-│   ├── connection_tracker.h   # Flow tracking (multi-threaded version)
-│   ├── load_balancer.h        # LB thread (multi-threaded version)
-│   ├── fast_path.h            # FP thread (multi-threaded version)
-│   ├── thread_safe_queue.h    # Thread-safe queue
-│   └── dpi_engine.h           # Main orchestrator
-│
-├── src/                        # Implementation files
-│   ├── pcap_reader.cpp        # PCAP file handling
-│   ├── packet_parser.cpp      # Protocol parsing
-│   ├── sni_extractor.cpp      # SNI/Host extraction
-│   ├── types.cpp              # Helper functions
-│   ├── main_working.cpp       # ★ SIMPLE VERSION ★
-│   ├── dpi_mt.cpp             # ★ MULTI-THREADED VERSION ★
-│   └── [other files]          # Supporting code
-│
-├── generate_test_pcap.py      # Creates test data
-├── test_dpi.pcap              # Sample capture with various traffic
-└── README.md                  # This file!
+```mermaid
+flowchart TD
+  reader["Reader keeps IPv4 TCP and UDP"]
+  lbPick["Choose one load balancer: hash of the directional 5-tuple, modulo LB count"]
+  lb["That load balancer's thread"]
+  fpPick["Choose one of its fast paths: same hash, modulo fps per LB"]
+  fp["That fast path classifies the directional flow and applies rules"]
+  writer["Output writer appends the packet to the PCAP"]
+  dropped["Packet is not written"]
+
+  reader --> lbPick --> lb --> fpPick --> fp
+  fp -->|forward| writer
+  fp -->|drop| dropped
 ```
 
----
+With the defaults, LB0 owns FP0 and FP1, and LB1 owns FP2 and FP3. Each packet is delivered to one load balancer and then to one fast path in that load balancer's group. A reversed packet, such as a SYN-ACK, has the opposite 5-tuple, so its hash can select a different load balancer and fast path. `FiveTuple::reverse()` exists in `include/types.h` and is not used by this pipeline.
 
-## 5. The Journey of a Packet (Simple Version)
+Each fast path has its own flow map. After the reader finishes, the process sleeps 500 ms and then stops the workers.
 
-Let's trace a single packet through `main_working.cpp`:
+### Classification
 
-### Step 1: Read PCAP File
+![Packet classification and blocking flow for the shipped v2.0 engine](docs/packet-classification-flow.png)
 
-```cpp
-PcapReader reader;
-reader.open("capture.pcap");
+Processing order inside one fast path:
+
+1. Look up the directional 5-tuple.
+2. If that flow is not yet classified, try the checks below.
+3. If the flow is not already blocked, apply rules to its source IP, app type, and SNI.
+4. Count the packet under the app type it has at that moment.
+5. Drop it, or push it to the output queue.
+
+Classification checks, in order:
+
+| Check | Result |
+| --- | --- |
+| Destination port 443 and a TLS Client Hello with SNI | App comes from `sniToAppType`. The flow is classified. |
+| Destination port 80 and an HTTP `Host` header | App comes from `sniToAppType`. The flow is classified. |
+| Port 53 in either direction | App is DNS. The flow is classified. The DNS name is not read. |
+| Destination port 443 with no SNI yet | App is HTTPS for this packet. The flow stays unclassified so a later Client Hello can replace it. |
+| Destination port 80 with no `Host` yet | App is HTTP for this packet. The flow stays unclassified. |
+
+`sniToAppType` lowercases the name and tests substrings in this order: Google, YouTube, Facebook, Instagram, WhatsApp, Twitter/X, Netflix, Amazon, Microsoft, Apple, Telegram, TikTok, Spotify, Zoom, Discord, GitHub, Cloudflare. A non-empty name that matches none of those patterns becomes HTTPS. The generator hosts `example.com` and `httpbin.org` take that path.
+
+Google is tested before YouTube and includes `ggpht`. A name such as `yt3.ggpht.com` is Google. The later YouTube pattern `yt3.ggpht` does not run for that name. Amazon includes the substring `aws`.
+
+`QUICSNIExtractor` is implemented in `src/sni_extractor.cpp` and is never called by v2.0. The enum values TLS and QUIC are never assigned on this path.
+
+The SNI walk in `SNIExtractor::extract` checks the handshake type, accepts record versions from SSL 3.0 through TLS 1.3, and advances through the session ID, cipher suites, compression methods, and extensions with bounds checks. This layout is the field order that walk follows. It is not a copy of the parser:
+
+```text
+Content type 0x16, record version, record length
+Handshake type 0x01, 24-bit length
+Client version, 32-byte random, session ID, cipher suites, compression
+Extensions, including type 0x0000 hostname SNI
 ```
 
-**What happens:**
-1. Open the file in binary mode
-2. Read the 24-byte global header (magic number, version, etc.)
-3. Verify it's a valid PCAP file
+### Blocking
 
-**PCAP File Format:**
-```
-┌────────────────────────────┐
-│ Global Header (24 bytes)   │  ← Read once at start
-├────────────────────────────┤
-│ Packet Header (16 bytes)   │  ← Timestamp, length
-│ Packet Data (variable)     │  ← Actual network bytes
-├────────────────────────────┤
-│ Packet Header (16 bytes)   │
-│ Packet Data (variable)     │
-├────────────────────────────┤
-│ ... more packets ...       │
-└────────────────────────────┘
+`Rules::isBlocked` checks the source IP, then the app type, then whether the stored SNI contains a blocked domain as a case-sensitive substring. Domain matching does not lowercase the SNI and does not treat `*.example.com` as a wildcard.
+
+An app name must match `appTypeToString` exactly, including `YouTube` and `Twitter/X`. An unknown name is reported and does not create a rule.
+
+An app block becomes sticky for later packets of that same directional flow. Packets seen before the SNI or `Host` header are forwarded. The reverse direction is a separate flow, so a SYN-ACK is not blocked merely because the forward Client Hello was blocked.
+
+The behavior below is a summary of `Rules::isBlocked` in `src/dpi_mt.cpp`, not a standalone program:
+
+```text
+if source IP is blocked: drop
+else if app type is blocked: drop
+else if any blocked domain is a substring of the SNI: drop
+else: forward
 ```
 
-### Step 2: Read Each Packet
+### Command-line interface
 
-```cpp
-while (reader.readNextPacket(raw)) {
-    // raw.data contains the packet bytes
-    // raw.header contains timestamp and length
-}
+```text
+dpi_engine <input.pcap> <output.pcap> [options]
 ```
 
-**What happens:**
-1. Read 16-byte packet header
-2. Read N bytes of packet data (N = header.incl_len)
-3. Return false when no more packets
+| Option | Meaning | Default |
+| --- | --- | --- |
+| `--block-ip <ipv4>` | Block that source address | none |
+| `--block-app <name>` | Block one `appTypeToString` name | none |
+| `--block-domain <text>` | Case-sensitive SNI substring | none |
+| `--lbs <n>` | Load-balancer threads | 2 |
+| `--fps <n>` | Fast paths owned by each load balancer | 2 |
 
-### Step 3: Parse Protocol Headers
+Fewer than three arguments prints usage and returns exit code 1. There is no separate `--help` flag. The usage text starts with `DPI Engine v2.0`.
 
-```cpp
-PacketParser::parse(raw, parsed);
+```text
+dpi_engine test_dpi.pcap output.pcap --block-app YouTube --block-ip 192.168.1.50
+dpi_engine test_dpi.pcap output.pcap --lbs 4 --fps 4
 ```
 
-**What happens (in packet_parser.cpp):**
+On Windows the executable name is `dpi_engine.exe`.
 
-```
-raw.data bytes:
-[0-13]   Ethernet Header
-[14-33]  IP Header  
-[34-53]  TCP Header
-[54+]    Payload
+### Text report
 
-After parsing:
-parsed.src_mac  = "00:11:22:33:44:55"
-parsed.dest_mac = "aa:bb:cc:dd:ee:ff"
-parsed.src_ip   = "192.168.1.100"
-parsed.dest_ip  = "172.217.14.206"
-parsed.src_port = 54321
-parsed.dest_port = 443
-parsed.protocol = 6 (TCP)
-parsed.has_tcp  = true
-```
+The report is written to standard output. Its sections are the thread banner, active rules, reader progress, packet counters, per-thread dispatch and processed counts, an application breakdown, and detected SNI or `Host` values.
 
-**Parsing the Ethernet Header (14 bytes):**
-```
-Bytes 0-5:   Destination MAC
-Bytes 6-11:  Source MAC
-Bytes 12-13: EtherType (0x0800 = IPv4)
-```
+Counters that `backend/tests/test_api.py` expects for a generated `test_dpi.pcap` with no rules:
 
-**Parsing the IP Header (20+ bytes):**
-```
-Byte 0:      Version (4 bits) + Header Length (4 bits)
-Byte 8:      TTL (Time To Live)
-Byte 9:      Protocol (6=TCP, 17=UDP)
-Bytes 12-15: Source IP
-Bytes 16-19: Destination IP
-```
+| Counter | Value |
+| --- | --- |
+| Total packets | 77 |
+| Total bytes | 5738 |
+| TCP packets | 73 |
+| UDP packets | 4 |
+| Forwarded | 77 |
+| Dropped | 0 |
+| Output PCAP size | 6994 bytes |
 
-**Parsing the TCP Header (20+ bytes):**
-```
-Bytes 0-1:   Source Port
-Bytes 2-3:   Destination Port
-Bytes 4-7:   Sequence Number
-Bytes 8-11:  Acknowledgment Number
-Byte 12:     Data Offset (header length)
-Byte 13:     Flags (SYN, ACK, FIN, etc.)
-```
+With only the IP rule `192.168.1.50`, the same test expects 72 forwarded and 5 dropped. Those five packets are the SYNs the generator writes from that address. Thread rows and per-app rows are not asserted. They depend on directional hashing, and the generator chooses ephemeral ports at random, so a pasted thread breakdown would not be a stable result.
 
-### Step 4: Create Five-Tuple and Look Up Flow
+Application counts are per packet, using the app type at the time that packet is processed. A YouTube handshake therefore does not count all four of its packets as YouTube: the SYN and ACK are still HTTPS, the Client Hello is YouTube, and the SYN-ACK is a separate Unknown flow.
 
-```cpp
-FiveTuple tuple;
-tuple.src_ip = parseIP(parsed.src_ip);
-tuple.dst_ip = parseIP(parsed.dest_ip);
-tuple.src_port = parsed.src_port;
-tuple.dst_port = parsed.dest_port;
-tuple.protocol = parsed.protocol;
+## Test capture
 
-Flow& flow = flows[tuple];  // Get or create
-```
+`test_dpi.pcap` is gitignored. Generate it from the repository root:
 
-**What happens:**
-- The flow table is a hash map: `FiveTuple → Flow`
-- If this 5-tuple exists, we get the existing flow
-- If not, a new flow is created
-- All packets with the same 5-tuple share the same flow
-
-### Step 5: Extract SNI (Deep Packet Inspection)
-
-```cpp
-// For HTTPS traffic (port 443)
-if (pkt.tuple.dst_port == 443 && pkt.payload_length > 5) {
-    auto sni = SNIExtractor::extract(payload, payload_length);
-    if (sni) {
-        flow.sni = *sni;                    // "www.youtube.com"
-        flow.app_type = sniToAppType(*sni); // AppType::YOUTUBE
-    }
-}
-```
-
-**What happens (in sni_extractor.cpp):**
-
-1. **Check if it's a TLS Client Hello:**
-   ```
-   Byte 0: Content Type = 0x16 (Handshake) ✓
-   Byte 5: Handshake Type = 0x01 (Client Hello) ✓
-   ```
-
-2. **Navigate to Extensions:**
-   ```
-   Skip: Version, Random, Session ID, Cipher Suites, Compression
-   ```
-
-3. **Find SNI Extension (type 0x0000):**
-   ```
-   Extension Type: 0x0000 (SNI)
-   Extension Length: N
-   SNI List Length: M
-   SNI Type: 0x00 (hostname)
-   SNI Length: L
-   SNI Value: "www.youtube.com"  ← FOUND!
-   ```
-
-4. **Map SNI to App Type:**
-   ```cpp
-   // In types.cpp
-   if (sni.find("youtube") != std::string::npos) {
-       return AppType::YOUTUBE;
-   }
-   ```
-
-### Step 6: Check Blocking Rules
-
-```cpp
-if (rules.isBlocked(tuple.src_ip, flow.app_type, flow.sni)) {
-    flow.blocked = true;
-}
-```
-
-**What happens:**
-```cpp
-// Check IP blacklist
-if (blocked_ips.count(src_ip)) return true;
-
-// Check app blacklist
-if (blocked_apps.count(app)) return true;
-
-// Check domain blacklist (substring match)
-for (const auto& dom : blocked_domains) {
-    if (sni.find(dom) != std::string::npos) return true;
-}
-
-return false;
-```
-
-### Step 7: Forward or Drop
-
-```cpp
-if (flow.blocked) {
-    dropped++;
-    // Don't write to output
-} else {
-    forwarded++;
-    // Write packet to output file
-    output.write(packet_header);
-    output.write(packet_data);
-}
-```
-
-### Step 8: Generate Report
-
-After processing all packets:
-```cpp
-// Count apps
-for (const auto& [tuple, flow] : flows) {
-    app_stats[flow.app_type]++;
-}
-
-// Print report
-"YouTube: 150 packets (15%)"
-"Facebook: 80 packets (8%)"
-...
-```
-
----
-
-## 6. The Journey of a Packet (Multi-threaded Version)
-
-The multi-threaded version (`dpi_mt.cpp`) adds **parallelism** for high performance:
-
-### Architecture Overview
-
-```
-                    ┌─────────────────┐
-                    │  Reader Thread  │
-                    │  (reads PCAP)   │
-                    └────────┬────────┘
-                             │
-              ┌──────────────┴──────────────┐
-              │      hash(5-tuple) % 2      │
-              ▼                             ▼
-    ┌─────────────────┐           ┌─────────────────┐
-    │  LB0 Thread     │           │  LB1 Thread     │
-    │  (Load Balancer)│           │  (Load Balancer)│
-    └────────┬────────┘           └────────┬────────┘
-             │                             │
-      ┌──────┴──────┐               ┌──────┴──────┐
-      │hash % 2     │               │hash % 2     │
-      ▼             ▼               ▼             ▼
-┌──────────┐ ┌──────────┐   ┌──────────┐ ┌──────────┐
-│FP0 Thread│ │FP1 Thread│   │FP2 Thread│ │FP3 Thread│
-│(Fast Path)│ │(Fast Path)│   │(Fast Path)│ │(Fast Path)│
-└─────┬────┘ └─────┬────┘   └─────┬────┘ └─────┬────┘
-      │            │              │            │
-      └────────────┴──────────────┴────────────┘
-                          │
-                          ▼
-              ┌───────────────────────┐
-              │   Output Queue        │
-              └───────────┬───────────┘
-                          │
-                          ▼
-              ┌───────────────────────┐
-              │  Output Writer Thread │
-              │  (writes to PCAP)     │
-              └───────────────────────┘
-```
-
-### Why This Design?
-
-1. **Load Balancers (LBs):** Distribute work across FPs
-2. **Fast Paths (FPs):** Do the actual DPI processing
-3. **Consistent Hashing:** Same 5-tuple always goes to same FP
-
-**Why consistent hashing matters:**
-```
-Connection: 192.168.1.100:54321 → 142.250.185.206:443
-
-Packet 1 (SYN):         hash → FP2
-Packet 2 (SYN-ACK):     hash → FP2  (same FP!)
-Packet 3 (Client Hello): hash → FP2  (same FP!)
-Packet 4 (Data):        hash → FP2  (same FP!)
-
-All packets of this connection go to FP2.
-FP2 can track the flow state correctly.
-```
-
-### Detailed Flow
-
-#### Step 1: Reader Thread
-
-```cpp
-// Main thread reads PCAP
-while (reader.readNextPacket(raw)) {
-    Packet pkt = createPacket(raw);
-    
-    // Hash to select Load Balancer
-    size_t lb_idx = hash(pkt.tuple) % num_lbs;
-    
-    // Push to LB's queue
-    lbs_[lb_idx]->queue().push(pkt);
-}
-```
-
-#### Step 2: Load Balancer Thread
-
-```cpp
-void LoadBalancer::run() {
-    while (running_) {
-        // Pop from my input queue
-        auto pkt = input_queue_.pop();
-        
-        // Hash to select Fast Path
-        size_t fp_idx = hash(pkt.tuple) % num_fps_;
-        
-        // Push to FP's queue
-        fps_[fp_idx]->queue().push(pkt);
-    }
-}
-```
-
-#### Step 3: Fast Path Thread
-
-```cpp
-void FastPath::run() {
-    while (running_) {
-        // Pop from my input queue
-        auto pkt = input_queue_.pop();
-        
-        // Look up flow (each FP has its own flow table)
-        Flow& flow = flows_[pkt.tuple];
-        
-        // Classify (SNI extraction)
-        classifyFlow(pkt, flow);
-        
-        // Check rules
-        if (rules_->isBlocked(pkt.tuple.src_ip, flow.app_type, flow.sni)) {
-            stats_->dropped++;
-        } else {
-            // Forward: push to output queue
-            output_queue_->push(pkt);
-        }
-    }
-}
-```
-
-#### Step 4: Output Writer Thread
-
-```cpp
-void outputThread() {
-    while (running_ || output_queue_.size() > 0) {
-        auto pkt = output_queue_.pop();
-        
-        // Write to output file
-        output_file.write(packet_header);
-        output_file.write(pkt.data);
-    }
-}
-```
-
-### Thread-Safe Queue
-
-The magic that makes multi-threading work:
-
-```cpp
-template<typename T>
-class TSQueue {
-    std::queue<T> queue_;
-    std::mutex mutex_;
-    std::condition_variable not_empty_;
-    std::condition_variable not_full_;
-    
-    void push(T item) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        queue_.push(item);
-        not_empty_.notify_one();  // Wake up waiting consumer
-    }
-    
-    T pop() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        not_empty_.wait(lock, [&]{ return !queue_.empty(); });
-        T item = queue_.front();
-        queue_.pop();
-        return item;
-    }
-};
-```
-
-**How it works:**
-- `push()`: Producer adds item, signals waiting consumers
-- `pop()`: Consumer waits until item available, then takes it
-- `mutex`: Only one thread can access at a time
-- `condition_variable`: Efficient waiting (no busy-loop)
-
----
-
-## 7. Deep Dive: Each Component
-
-### pcap_reader.h / pcap_reader.cpp
-
-**Purpose:** Read network captures saved by Wireshark
-
-**Key structures:**
-```cpp
-struct PcapGlobalHeader {
-    uint32_t magic_number;   // 0xa1b2c3d4 identifies PCAP
-    uint16_t version_major;  // Usually 2
-    uint16_t version_minor;  // Usually 4
-    uint32_t snaplen;        // Max packet size captured
-    uint32_t network;        // 1 = Ethernet
-};
-
-struct PcapPacketHeader {
-    uint32_t ts_sec;         // Timestamp (seconds)
-    uint32_t ts_usec;        // Timestamp (microseconds)
-    uint32_t incl_len;       // Bytes saved in file
-    uint32_t orig_len;       // Original packet size
-};
-```
-
-**Key functions:**
-- `open(filename)`: Open PCAP, validate header
-- `readNextPacket(raw)`: Read next packet into buffer
-- `close()`: Clean up
-
-### packet_parser.h / packet_parser.cpp
-
-**Purpose:** Extract protocol fields from raw bytes
-
-**Key function:**
-```cpp
-bool PacketParser::parse(const RawPacket& raw, ParsedPacket& parsed) {
-    parseEthernet(...);  // Extract MACs, EtherType
-    parseIPv4(...);      // Extract IPs, protocol, TTL
-    parseTCP(...);       // Extract ports, flags, seq numbers
-    // OR
-    parseUDP(...);       // Extract ports
-}
-```
-
-**Important concepts:**
-
-*Network Byte Order:* Network protocols use big-endian (most significant byte first). Your computer might use little-endian. We use `ntohs()` and `ntohl()` to convert:
-```cpp
-// ntohs = Network TO Host Short (16-bit)
-uint16_t port = ntohs(*(uint16_t*)(data + offset));
-
-// ntohl = Network TO Host Long (32-bit)
-uint32_t seq = ntohl(*(uint32_t*)(data + offset));
-```
-
-### sni_extractor.h / sni_extractor.cpp
-
-**Purpose:** Extract domain names from TLS and HTTP
-
-**For TLS (HTTPS):**
-```cpp
-std::optional<std::string> SNIExtractor::extract(
-    const uint8_t* payload, 
-    size_t length
-) {
-    // 1. Verify TLS record header
-    // 2. Verify Client Hello handshake
-    // 3. Skip to extensions
-    // 4. Find SNI extension (type 0x0000)
-    // 5. Extract hostname string
-}
-```
-
-**For HTTP:**
-```cpp
-std::optional<std::string> HTTPHostExtractor::extract(
-    const uint8_t* payload,
-    size_t length
-) {
-    // 1. Verify HTTP request (GET, POST, etc.)
-    // 2. Search for "Host: " header
-    // 3. Extract value until newline
-}
-```
-
-### types.h / types.cpp
-
-**Purpose:** Define data structures used throughout
-
-**FiveTuple:**
-```cpp
-struct FiveTuple {
-    uint32_t src_ip;
-    uint32_t dst_ip;
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint8_t  protocol;
-    
-    bool operator==(const FiveTuple& other) const;
-};
-```
-
-**AppType:**
-```cpp
-enum class AppType {
-    UNKNOWN,
-    HTTP,
-    HTTPS,
-    DNS,
-    GOOGLE,
-    YOUTUBE,
-    FACEBOOK,
-    // ... more apps
-};
-```
-
-**sniToAppType function:**
-```cpp
-AppType sniToAppType(const std::string& sni) {
-    if (sni.find("youtube") != std::string::npos) 
-        return AppType::YOUTUBE;
-    if (sni.find("facebook") != std::string::npos) 
-        return AppType::FACEBOOK;
-    // ... more patterns
-}
-```
-
----
-
-## 8. How SNI Extraction Works
-
-### The TLS Handshake
-
-When you visit `https://www.youtube.com`:
-
-```
-┌──────────┐                              ┌──────────┐
-│  Browser │                              │  Server  │
-└────┬─────┘                              └────┬─────┘
-     │                                         │
-     │ ──── Client Hello ─────────────────────►│
-     │      (includes SNI: www.youtube.com)    │
-     │                                         │
-     │ ◄─── Server Hello ───────────────────── │
-     │      (includes certificate)             │
-     │                                         │
-     │ ──── Key Exchange ─────────────────────►│
-     │                                         │
-     │ ◄═══ Encrypted Data ══════════════════► │
-     │      (from here on, everything is       │
-     │       encrypted - we can't see it)      │
-```
-
-**We can only extract SNI from the Client Hello!**
-
-### TLS Client Hello Structure
-
-```
-Byte 0:     Content Type = 0x16 (Handshake)
-Bytes 1-2:  Version = 0x0301 (TLS 1.0)
-Bytes 3-4:  Record Length
-
--- Handshake Layer --
-Byte 5:     Handshake Type = 0x01 (Client Hello)
-Bytes 6-8:  Handshake Length
-
--- Client Hello Body --
-Bytes 9-10:  Client Version
-Bytes 11-42: Random (32 bytes)
-Byte 43:     Session ID Length (N)
-Bytes 44 to 44+N: Session ID
-... Cipher Suites ...
-... Compression Methods ...
-
--- Extensions --
-Bytes X-X+1: Extensions Length
-For each extension:
-    Bytes: Extension Type (2)
-    Bytes: Extension Length (2)
-    Bytes: Extension Data
-
--- SNI Extension (Type 0x0000) --
-Extension Type: 0x0000
-Extension Length: L
-  SNI List Length: M
-  SNI Type: 0x00 (hostname)
-  SNI Length: K
-  SNI Value: "www.youtube.com" ← THE GOAL!
-```
-
-### Our Extraction Code (Simplified)
-
-```cpp
-std::optional<std::string> SNIExtractor::extract(
-    const uint8_t* payload, size_t length
-) {
-    // Check TLS record header
-    if (payload[0] != 0x16) return std::nullopt;  // Not handshake
-    if (payload[5] != 0x01) return std::nullopt;  // Not Client Hello
-    
-    size_t offset = 43;  // Skip to session ID
-    
-    // Skip Session ID
-    uint8_t session_len = payload[offset];
-    offset += 1 + session_len;
-    
-    // Skip Cipher Suites
-    uint16_t cipher_len = readUint16BE(payload + offset);
-    offset += 2 + cipher_len;
-    
-    // Skip Compression Methods
-    uint8_t comp_len = payload[offset];
-    offset += 1 + comp_len;
-    
-    // Read Extensions Length
-    uint16_t ext_len = readUint16BE(payload + offset);
-    offset += 2;
-    
-    // Search for SNI extension
-    size_t ext_end = offset + ext_len;
-    while (offset + 4 <= ext_end) {
-        uint16_t ext_type = readUint16BE(payload + offset);
-        uint16_t ext_data_len = readUint16BE(payload + offset + 2);
-        offset += 4;
-        
-        if (ext_type == 0x0000) {  // SNI!
-            // Parse SNI structure
-            uint16_t sni_len = readUint16BE(payload + offset + 3);
-            return std::string(
-                (char*)(payload + offset + 5), 
-                sni_len
-            );
-        }
-        
-        offset += ext_data_len;
-    }
-    
-    return std::nullopt;  // SNI not found
-}
-```
-
----
-
-## 9. How Blocking Works
-
-### Rule Types
-
-| Rule Type | Example | What it Blocks |
-|-----------|---------|----------------|
-| IP | `192.168.1.50` | All traffic from this source |
-| App | `YouTube` | All YouTube connections |
-| Domain | `tiktok` | Any SNI containing "tiktok" |
-
-### The Blocking Flow
-
-```
-Packet arrives
-      │
-      ▼
-┌─────────────────────────────────┐
-│ Is source IP in blocked list?  │──Yes──► DROP
-└───────────────┬─────────────────┘
-                │No
-                ▼
-┌─────────────────────────────────┐
-│ Is app type in blocked list?   │──Yes──► DROP
-└───────────────┬─────────────────┘
-                │No
-                ▼
-┌─────────────────────────────────┐
-│ Does SNI match blocked domain? │──Yes──► DROP
-└───────────────┬─────────────────┘
-                │No
-                ▼
-            FORWARD
-```
-
-### Flow-Based Blocking
-
-**Important:** We block at the *flow* level, not packet level.
-
-```
-Connection to YouTube:
-  Packet 1 (SYN)           → No SNI yet, FORWARD
-  Packet 2 (SYN-ACK)       → No SNI yet, FORWARD  
-  Packet 3 (ACK)           → No SNI yet, FORWARD
-  Packet 4 (Client Hello)  → SNI: www.youtube.com
-                           → App: YOUTUBE (blocked!)
-                           → Mark flow as BLOCKED
-                           → DROP this packet
-  Packet 5 (Data)          → Flow is BLOCKED → DROP
-  Packet 6 (Data)          → Flow is BLOCKED → DROP
-  ...all subsequent packets → DROP
-```
-
-**Why this approach?**
-- We can't identify the app until we see the Client Hello
-- Once identified, we block all future packets of that flow
-- The connection will fail/timeout on the client
-
----
-
-## 10. Building and Running
-
-### Prerequisites
-
-- **macOS/Linux** with C++17 compiler
-- **g++** or **clang++**
-- No external libraries needed!
-
-### Build Commands
-
-**Simple Version:**
 ```bash
-g++ -std=c++17 -O2 -I include -o dpi_simple \
-    src/main_working.cpp \
-    src/pcap_reader.cpp \
-    src/packet_parser.cpp \
-    src/sni_extractor.cpp \
-    src/types.cpp
+python generate_test_pcap.py
 ```
 
-**Multi-threaded Version:**
+The script writes `test_dpi.pcap` in the current directory. Its contents are:
+
+| Traffic | Packets |
+| --- | --- |
+| 16 TLS connections on port 443, each SYN, SYN-ACK, ACK, and Client Hello | 64 |
+| 2 HTTP connections on port 80, each SYN and request | 4 |
+| 4 DNS queries to `8.8.8.8` | 4 |
+| 5 TCP SYNs from `192.168.1.50` | 5 |
+
+The Client Hello names are `www.google.com`, `www.youtube.com`, `www.facebook.com`, `www.instagram.com`, `twitter.com`, `www.amazon.com`, `www.netflix.com`, `github.com`, `discord.com`, `zoom.us`, `web.telegram.org`, `www.tiktok.com`, `open.spotify.com`, `www.cloudflare.com`, `www.microsoft.com`, and `www.apple.com`. The HTTP hosts are `example.com` and `httpbin.org`.
+
+Timestamps, IPv4 identification, TLS random bytes, DNS transaction IDs, and ephemeral ports use unseeded `random`. Those fields have fixed widths, so the packet count and byte length stay the same while the file bytes change from run to run. Do not force-add the capture to Git.
+
+## Setup
+
+Requirements for the engine are a C++17 compiler. The engine sources do not link a third-party PCAP library. The API needs Python 3. The dashboard needs Node.js and npm.
+
+[`WINDOWS_SETUP.md`](WINDOWS_SETUP.md) has installer steps for Visual Studio, MinGW-w64, and WSL. Use the commands in this README to build and run. `CMakeLists.txt` produces `packet_analyzer` from the packet printer sources. Building that CMake target does not produce the v2.0 engine.
+
+### C++ engine
+
+From the repository root.
+
+Linux, macOS, or WSL:
+
 ```bash
 g++ -std=c++17 -pthread -O2 -I include -o dpi_engine \
     src/dpi_mt.cpp \
@@ -892,163 +271,306 @@ g++ -std=c++17 -pthread -O2 -I include -o dpi_engine \
     src/types.cpp
 ```
 
-### Running
+The API looks for `dpi_engine.exe` unless `DEEPTRACE_ENGINE_PATH` points at `./dpi_engine`.
 
-**Basic usage:**
+Windows, Visual C++ developer prompt:
+
+```bat
+cl /EHsc /std:c++17 /O2 /I include /Fe:dpi_engine.exe ^
+    src\dpi_mt.cpp ^
+    src\pcap_reader.cpp ^
+    src\packet_parser.cpp ^
+    src\sni_extractor.cpp ^
+    src\types.cpp
+```
+
+Windows, MinGW-w64:
+
+```bat
+g++ -std=c++17 -pthread -O2 -I include -o dpi_engine.exe ^
+    src/dpi_mt.cpp ^
+    src/pcap_reader.cpp ^
+    src/packet_parser.cpp ^
+    src/sni_extractor.cpp ^
+    src/types.cpp
+```
+
+Single-threaded DPI tool:
+
+```bash
+g++ -std=c++17 -O2 -I include -o dpi_simple \
+    src/main_working.cpp \
+    src/pcap_reader.cpp \
+    src/packet_parser.cpp \
+    src/sni_extractor.cpp \
+    src/types.cpp
+```
+
+SNI printer:
+
+```bash
+g++ -std=c++17 -O2 -I include -o sni_printer \
+    src/main_simple.cpp \
+    src/pcap_reader.cpp \
+    src/packet_parser.cpp \
+    src/sni_extractor.cpp \
+    src/types.cpp
+```
+
+Packet printer, which is also the CMake target:
+
+```bash
+g++ -std=c++17 -O2 -I include -o packet_analyzer \
+    src/main.cpp \
+    src/pcap_reader.cpp \
+    src/packet_parser.cpp
+```
+
+```bash
+cmake -S . -B build
+cmake --build build
+```
+
+Run v2.0 after generating the capture:
+
 ```bash
 ./dpi_engine test_dpi.pcap output.pcap
 ```
 
-**With blocking:**
-```bash
-./dpi_engine test_dpi.pcap output.pcap \
-    --block-app YouTube \
-    --block-app TikTok \
-    --block-ip 192.168.1.50 \
-    --block-domain facebook
+```bat
+dpi_engine.exe test_dpi.pcap output.pcap
 ```
 
-**Configure threads (multi-threaded only):**
-```bash
-./dpi_engine input.pcap output.pcap --lbs 4 --fps 4
-# Creates 4 LB threads × 4 FP threads = 16 processing threads
-```
+### Backend
 
-### Creating Test Data
+From the repository root:
 
 ```bash
-python3 generate_test_pcap.py
-# Creates test_dpi.pcap with sample traffic
+python -m venv .venv
 ```
 
----
+Windows PowerShell:
 
-## 11. Understanding the Output
-
-### Sample Output
-
-```
-╔══════════════════════════════════════════════════════════════╗
-║              DPI ENGINE v2.0 (Multi-threaded)                 ║
-╠══════════════════════════════════════════════════════════════╣
-║ Load Balancers:  2    FPs per LB:  2    Total FPs:  4        ║
-╚══════════════════════════════════════════════════════════════╝
-
-[Rules] Blocked app: YouTube
-[Rules] Blocked IP: 192.168.1.50
-
-[Reader] Processing packets...
-[Reader] Done reading 77 packets
-
-╔══════════════════════════════════════════════════════════════╗
-║                      PROCESSING REPORT                        ║
-╠══════════════════════════════════════════════════════════════╣
-║ Total Packets:                77                              ║
-║ Total Bytes:                5738                              ║
-║ TCP Packets:                  73                              ║
-║ UDP Packets:                   4                              ║
-╠══════════════════════════════════════════════════════════════╣
-║ Forwarded:                    69                              ║
-║ Dropped:                       8                              ║
-╠══════════════════════════════════════════════════════════════╣
-║ THREAD STATISTICS                                             ║
-║   LB0 dispatched:             53                              ║
-║   LB1 dispatched:             24                              ║
-║   FP0 processed:              53                              ║
-║   FP1 processed:               0                              ║
-║   FP2 processed:               0                              ║
-║   FP3 processed:              24                              ║
-╠══════════════════════════════════════════════════════════════╣
-║                   APPLICATION BREAKDOWN                       ║
-╠══════════════════════════════════════════════════════════════╣
-║ HTTPS                39  50.6% ##########                     ║
-║ Unknown              16  20.8% ####                           ║
-║ YouTube               4   5.2% # (BLOCKED)                    ║
-║ DNS                   4   5.2% #                              ║
-║ Facebook              3   3.9%                                ║
-║ ...                                                           ║
-╚══════════════════════════════════════════════════════════════╝
-
-[Detected Domains/SNIs]
-  - www.youtube.com -> YouTube
-  - www.facebook.com -> Facebook
-  - www.google.com -> Google
-  - github.com -> GitHub
-  ...
+```powershell
+.\.venv\Scripts\Activate.ps1
+pip install -r backend/requirements.txt
+cd backend
+uvicorn app.main:app --reload
 ```
 
-### What Each Section Means
+Linux or macOS:
 
-| Section | Meaning |
-|---------|---------|
-| Configuration | Number of threads created |
-| Rules | Which blocking rules are active |
-| Total Packets | Packets read from input file |
-| Forwarded | Packets written to output file |
-| Dropped | Packets blocked (not written) |
-| Thread Statistics | Work distribution across threads |
-| Application Breakdown | Traffic classification results |
-| Detected SNIs | Actual domain names found |
+```bash
+source .venv/bin/activate
+pip install -r backend/requirements.txt
+cd backend
+uvicorn app.main:app --reload
+```
 
----
+Uvicorn's default listen address is `http://127.0.0.1:8000`. The app factory is `app.main:app`, and the process must be started with `backend/` as the working directory so `app` imports resolve. Dependencies are FastAPI, Uvicorn, Pydantic, HTTPX, pytest, and pytest-asyncio, pinned in [`backend/requirements.txt`](backend/requirements.txt).
 
-## 12. Extending the Project
+### Dashboard setup
 
-### Ideas for Improvement
+```bash
+cd frontend
+npm install
+npm run dev
+npm run typecheck
+npm run build
+npm run preview
+```
 
-1. **Add More App Signatures**
-   ```cpp
-   // In types.cpp
-   if (sni.find("twitch") != std::string::npos)
-       return AppType::TWITCH;
-   ```
+`frontend/vite.config.ts` does not set `server.port` or `server.host`. The URL is the one Vite prints when `npm run dev` starts.
 
-2. **Add Bandwidth Throttling**
-   ```cpp
-   // Instead of DROP, delay packets
-   if (shouldThrottle(flow)) {
-       std::this_thread::sleep_for(10ms);
-   }
-   ```
+## Environment variables
 
-3. **Add Live Statistics Dashboard**
-   ```cpp
-   // Separate thread printing stats every second
-   void statsThread() {
-       while (running) {
-           printStats();
-           sleep(1);
-       }
-   }
-   ```
+All of these are optional. Defaults come from [`backend/app/config.py`](backend/app/config.py).
 
-4. **Add QUIC/HTTP3 Support**
-   - QUIC uses UDP on port 443
-   - SNI is in the Initial packet (encrypted differently)
+| Variable | Default |
+| --- | --- |
+| `DEEPTRACE_PROJECT_ROOT` | Repository root, two parents above `backend/app/config.py` |
+| `DEEPTRACE_ENGINE_PATH` | `<project root>/dpi_engine.exe` |
+| `DEEPTRACE_ANALYSIS_DIR` | `<project root>/.deeptrace-runs` |
+| `DEEPTRACE_RULES_PATH` | `<analysis dir>/rules.json` |
+| `DEEPTRACE_ENGINE_TIMEOUT` | `300` seconds. The value must be greater than zero. |
 
-5. **Add Persistent Rules**
-   - Save rules to file
-   - Load on startup
+On Linux or macOS, set `DEEPTRACE_ENGINE_PATH` to the `dpi_engine` binary produced by `g++`. The tests in `backend/tests/conftest.py` pin the engine path to `<project root>/dpi_engine.exe` and the timeout to 30 seconds.
 
----
+## HTTP API
 
-## Summary
+The service title is DeepTrace API, version 0.1.0. Routes are mounted under `/api`.
 
-This DPI engine demonstrates:
+### Health
 
-1. **Network Protocol Parsing** - Understanding packet structure
-2. **Deep Packet Inspection** - Looking inside encrypted connections
-3. **Flow Tracking** - Managing stateful connections
-4. **Multi-threaded Architecture** - Scaling with thread pools
-5. **Producer-Consumer Pattern** - Thread-safe queues
+`GET /api/health`
 
-The key insight is that even HTTPS traffic leaks the destination domain in the TLS handshake, allowing network operators to identify and control application usage.
+```json
+{
+  "status": "ok",
+  "engine": {
+    "available": true,
+    "path": "<project root>/dpi_engine.exe",
+    "version": "2.0",
+    "detail": "Engine executable is available"
+  }
+}
+```
 
----
+`status` is `ok` when the API process is up. `engine.available` is a separate field and is false when the executable is missing or cannot start.
 
-## Questions?
+### Engine status
 
-If you have questions about any part of this project, the code is well-commented and follows the same flow described in this document. Start with the simple version (`main_working.cpp`) to understand the concepts, then move to the multi-threaded version (`dpi_mt.cpp`) to see how parallelism is added.
+`GET /api/engine/status`
 
-Happy learning! 🚀
-# Deeptrace
+Returns the same `engine` object. Availability is true when the executable exists and running it with `--help` exits 0 or 1. v2.0 treats that extra argument as usage and exits 1, which this check accepts. The version is parsed from `DPI Engine v` followed by a version token in either output stream.
+
+### Analyses
+
+`POST /api/analyses`
+
+```json
+{ "input_file": "test_dpi.pcap" }
+```
+
+The path may be relative to the project root. It must resolve to an existing file inside that root, must not be the root directory itself, and must use a `.pcap` suffix. The magic number must be classic PCAP or nanosecond PCAP, in either endianness.
+
+The service writes `<analysis dir>/<id>.pcap`, passes every enabled rule to the engine, and parses the report. `packets` is a second parse of the input capture, so frames the engine dropped are still listed.
+
+```json
+{
+  "id": "hex",
+  "input_file": "absolute input path",
+  "output_file": "absolute output path",
+  "created_at": "UTC timestamp",
+  "report": {
+    "total_packets": 77,
+    "total_bytes": 5738,
+    "tcp_packets": 73,
+    "udp_packets": 4,
+    "forwarded_packets": 77,
+    "dropped_packets": 0,
+    "thread_statistics": [],
+    "applications": [],
+    "domains": []
+  },
+  "packets": []
+}
+```
+
+The numeric report fields above are the no-rule expectations from the API test. `thread_statistics` and `applications` are empty with the current parser even when the text report contains those sections. See [Limitations](#limitations). `domains` can contain entries parsed from lines such as `- www.youtube.com -> YouTube`. Each packet record has `index`, `timestamp`, `length`, `source_ip`, `destination_ip`, `protocol`, `source_port`, and `destination_port`. Ephemeral ports and timestamp fractions come from the generator's unseeded random values, so they are not listed here.
+
+| Status | When |
+| --- | --- |
+| 200 | Analysis finished |
+| 400 | Path is outside the project, missing, not a file, not `.pcap`, or has a rejected magic number |
+| 422 | The engine report is missing one of the six counters, or the input PCAP is truncated while packets are listed |
+| 502 | The engine is missing, exits non-zero, or does not create the output PCAP |
+| 504 | The run exceeds `DEEPTRACE_ENGINE_TIMEOUT` |
+
+Enabled rules are appended in stored order:
+
+| Rule type | Engine argument |
+| --- | --- |
+| `ip` | `--block-ip <value>` |
+| `app` | `--block-app <value>` |
+| `domain` | `--block-domain <value>` |
+
+The API reads standard output and standard error together, so the report is found on either stream.
+
+### Rules
+
+| Method | Path | Success |
+| --- | --- | --- |
+| `GET` | `/api/rules` | 200 and a JSON array |
+| `POST` | `/api/rules` | 201 and the created rule |
+| `PATCH` | `/api/rules/{rule_id}` | 200 and the updated rule |
+| `DELETE` | `/api/rules/{rule_id}` | 204 with no body |
+
+Request body for create and update:
+
+```json
+{ "type": "ip", "value": "192.168.1.50", "enabled": true }
+```
+
+`type` is `ip`, `app`, or `domain`. `value` is required, at most 253 characters. `enabled` defaults to true. A stored rule also has `id` and `created_at`.
+
+Validation:
+
+| Type | Accepted value |
+| --- | --- |
+| `ip` | An address accepted by Python's `ipaddress`, including IPv6 |
+| `app` | One of Google, YouTube, Facebook, Instagram, Twitter/X, Netflix, Amazon, Microsoft, Apple, WhatsApp, Telegram, TikTok, Spotify, Zoom, Discord, GitHub, Cloudflare, HTTP, HTTPS, DNS, TLS, QUIC |
+| `domain` | After an optional `*.` prefix, the remainder must contain a dot and no whitespace. The stored value keeps the prefix. |
+
+Invalid values return 422. An unknown rule id on update or delete returns 404.
+
+TLS and QUIC are accepted as API app names. v2.0 never assigns those app types, so those rules do not match traffic. An IPv6 rule passes API validation. v2.0 parses dotted IPv4 into a 32-bit value, so an IPv6 rule does not match packets. A domain stored as `*.example.com` is sent to v2.0 unchanged, and v2.0 looks for that literal substring.
+
+## Dashboard
+
+The frontend is a React 18, Vite, and Tailwind shell. It has no API client.
+
+| Path | Screen |
+| --- | --- |
+| `/` | Dashboard |
+| `/blocking-rules` | Placeholder section |
+| `/performance` | Placeholder section |
+| `/pcap-files` | Placeholder section |
+| `/recent-packets` | Placeholder section |
+| `/domains` | Placeholder section |
+
+Any other path redirects to `/`. The dashboard label is `Temporary fixture data (Phase 3 visual shell only)`, and the dashboard page states `No backend integration in this phase.` Charts and KPI figures in `frontend/src/lib/fixtures.ts` are hardcoded sample UI data. They are not measurements from the engine.
+
+## Tests
+
+From `backend/` with the virtual environment active and `backend/` on the import path:
+
+```bash
+cd backend
+pytest
+```
+
+`backend/tests/conftest.py` inserts `backend/` onto `sys.path` and builds the app with a temporary rules file and analysis directory. These tests call the real `dpi_engine.exe` and read `test_dpi.pcap` from the project root:
+
+- `test_health_and_engine_status`
+- `test_successful_analysis_against_sample_pcap`
+- `test_ip_blocking_is_applied_by_engine`
+
+Path, timeout, failure, and rule-lifecycle tests do not need a successful engine run. The timeout and failure tests replace `run_analysis`.
+
+Frontend typecheck:
+
+```bash
+cd frontend
+npm run typecheck
+```
+
+There is no frontend lint script.
+
+## Limitations
+
+- v2.0 reads classic PCAP magic `0xa1b2c3d4` and the swapped magic `0xd4c3b2a1`. The API also accepts nanosecond PCAP magic. A nanosecond file can pass the API check and then fail in the engine, which returns 502.
+- The engine keeps IPv4 TCP and UDP. Other packets are skipped and are not included in the packet counters. Payload offsets assume a 14-byte Ethernet header, so VLAN tags are not handled. IPv6 is not inspected.
+- SNI is taken only from a Client Hello whose destination port is 443. Encrypted Client Hello hides that name. HTTP `Host` is read only when the destination port is 80. DNS is classified by port 53 only.
+- QUIC on UDP/443 is not classified. The QUIC helper in `src/sni_extractor.cpp` is unused by v2.0.
+- Flows and hashes are directional. Blocking does not follow the reverse tuple.
+- The reader sleeps 500 ms and then stops workers that still have queued packets. Those packets can be included in the input counters and then neither forwarded nor dropped. The 77-packet API test observes no loss: 77 forwarded and 0 dropped with no rules.
+- Domain rules are case-sensitive substrings. App rules that the API accepts for TLS, QUIC, and IPv6 do not match this engine's classifier or IPv4 parser.
+- `parse_report` extracts the six counters from anywhere in a line, so the box-drawing characters around those counters still work. Application and thread lines in the text report start with `║`, and the parser only matches those rows at the start of a stripped line, so `applications` and `thread_statistics` come back empty. Domain lines after the report box can match.
+- The dashboard does not load analyses, rules, or captures.
+- Engine binaries and every PCAP are gitignored. A fresh clone has neither `dpi_engine.exe` nor `test_dpi.pcap` until they are built and generated.
+- No performance numbers are published here. The fixture KPI values in the dashboard are UI placeholders.
+
+## Roadmap
+
+These items are not implemented on the shipped path:
+
+- Tie both directions of a connection to one flow before applying a block.
+- Drain the worker queues before shutdown, instead of sleeping for a fixed 500 ms.
+- Parse application and thread rows from the boxed report, and test those fields.
+- Make domain rules mean one thing in the API and in v2.0. Today the API accepts a `*.` prefix and v2.0 searches for that literal text.
+- Reject or ignore API app names and address families that v2.0 cannot enforce, including TLS, QUIC, and IPv6, until the engine implements them.
+- Call a real QUIC Client Hello parser. The unused extractor is not that parser.
+- Connect the dashboard to `/api/analyses` and `/api/rules`, and replace `frontend/src/lib/fixtures.ts`.
+
+v1.0 already contains a rule file loader and a `*.example.com` suffix match. That code remains unlinked from `dpi_engine.exe`.
