@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply m-0 bg-dt-bg text-dt-text antialiased;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #1f2e2a #0c1211;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #20312d;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0c1211;
+}
+
+@layer components {
+  .panel {
+    @apply rounded-panel border border-dt-border bg-dt-panel shadow-panel;
+  }
+
+  .panel-title {
+    @apply text-sm font-medium tracking-wide text-dt-muted;
+  }
+
+  .state-label {
+    @apply inline-flex items-center rounded-md border border-dt-border bg-dt-panelAlt px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-dt-muted;
+  }
+}
