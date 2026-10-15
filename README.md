@@ -510,6 +510,8 @@ TLS and QUIC are accepted as API app names. v2.0 never assigns those app types, 
 
 The frontend is a React 18, Vite, and Tailwind shell. It has no API client.
 
+![DeepTrace dashboard shell. The figures are temporary fixture data, not engine measurements.](docs/deeptrace-dashboard.png)
+
 | Path | Screen |
 | --- | --- |
 | `/` | Dashboard |
